@@ -29,6 +29,7 @@ class RolloutStorage:
             self.privileged_actions: torch.Tensor | None = None
             self.rewards: torch.Tensor | None = None
             self.dones: torch.Tensor | None = None
+            self.true_dones: torch.Tensor | None = None
             self.values: torch.Tensor | None = None
             self.actions_log_prob: torch.Tensor
             self.action_mean: torch.Tensor | None = None
@@ -61,7 +62,8 @@ class RolloutStorage:
         )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.true_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For distillation
         if training_type == "distillation":
@@ -93,6 +95,7 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.true_dones[self.step].copy_(transition.true_dones.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
@@ -194,9 +197,9 @@ class RolloutStorage:
                 stop = (i + 1) * mini_batch_size
 
                 dones = self.dones.squeeze(-1)
-                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+                last_was_done = torch.zeros_like(dones)
                 last_was_done[1:] = dones[:-1]
-                last_was_done[0] = True
+                last_was_done[0] = 1.0
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
                 last_traj = first_traj + trajectories_batch_size
 
