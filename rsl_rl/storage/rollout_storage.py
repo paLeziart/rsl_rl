@@ -42,6 +42,9 @@ class RolloutStorage:
             self.dones: torch.Tensor | None = None
             """Done flags indicating episode termination."""
 
+            self.cstr_dones: torch.Tensor | None = None
+            """Probabilities from Constraints as Terminations."""
+
             # For reinforcement learning
             self.values: torch.Tensor | None = None
             """Value estimates at the current step (RL only)."""
@@ -146,19 +149,24 @@ class RolloutStorage:
         )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.cstr_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For reinforcement learning
-        if training_type == "rl":
+        if "rl" in training_type:
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+
+        # For reinforcement learning with constraints as terminations
+        if "CaT" in training_type:
+            self.cstr_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For recurrent networks
         self.saved_hidden_state_a = None
@@ -178,6 +186,7 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.cstr_dones[self.step].copy_(transition.cstr_dones.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
@@ -221,7 +230,7 @@ class RolloutStorage:
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
-        if self.training_type != "rl":
+        if "rl" not in self.training_type:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -259,7 +268,7 @@ class RolloutStorage:
         self, num_mini_batches: int, num_epochs: int = 8
     ) -> Generator[Batch, None, None]:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
-        if self.training_type != "rl":
+        if "rl" not in self.training_type:
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         mini_batch_size = self.num_envs // num_mini_batches
