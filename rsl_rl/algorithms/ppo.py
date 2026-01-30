@@ -146,8 +146,8 @@ class PPO:
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
-        self.transition.dones = extras["cstr_probs"]
-        self.transition.true_dones = dones
+        self.transition.dones = dones
+        self.transition.cstr_dones = extras["cstr_probs"]
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -178,7 +178,7 @@ class PPO:
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
             # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - st.dones[step].float()
-            next_is_not_terminal *= 1.0 - st.true_dones[step].float()
+            next_is_not_terminal *= 1.0 - st.cstr_dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
             delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
