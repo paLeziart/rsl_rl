@@ -11,12 +11,13 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import PPO, PPOCat, PPOCatTeacherStudent
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
     ActorCriticRecurrent,
+    ActorCriticTeacherStudent,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
@@ -78,15 +79,17 @@ class OnPolicyRunner:
         # Start training
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        switch = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
         for it in range(start_it, total_it):
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
-                    actions = self.alg.act(obs)
+                    actions = self.alg.act(obs, switch=switch)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    extras["switch"] = switch  # Store who controlled the envs (either student or teacher)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
@@ -246,7 +249,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | PPOCat | PPOCatTeacherStudent:
         """Construct the actor-critic algorithm."""
         # Resolve RND config if used
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -268,18 +271,18 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = resolve_callable(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | ActorCriticTeacherStudent = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # Initialize the storage
         storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            "rl-CaT-TS", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
         )
 
         # Initialize the algorithm
         alg_class = resolve_callable(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(
+        alg: PPO | PPOCat | PPOCatTeacherStudent = alg_class(
             actor_critic, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

@@ -35,6 +35,7 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            self.switch: torch.Tensor | None = None
 
         def clear(self) -> None:
             self.__init__()
@@ -63,20 +64,27 @@ class RolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-        self.cstr_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For reinforcement learning
-        if training_type == "rl":
+        if "rl" in training_type:
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+
+        # For reinforcement learning with constraints as terminations
+        if "CaT" in training_type:
+            self.cstr_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+
+        # For reinforcement learning with teacher-student mix
+        if "TS" in training_type:
+            self.switch = torch.zeros(num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=self.device)
 
         # For RNN networks
         self.saved_hidden_state_a = None
@@ -95,18 +103,25 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
-        self.cstr_dones[self.step].copy_(transition.cstr_dones.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
         # For reinforcement learning
-        if self.training_type == "rl":
+        if "rl" in self.training_type:
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
+
+        # For reinforcement learning with constraints as terminations
+        if "CaT" in self.training_type:
+            self.cstr_dones[self.step].copy_(transition.cstr_dones.view(-1, 1))
+
+        # For reinforcement learning with teacher-student mix
+        if "TS" in self.training_type:
+            self.switch[self.step].copy_(transition.switch)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -127,7 +142,7 @@ class RolloutStorage:
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type != "rl":
+        if "rl" not in self.training_type:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -145,6 +160,10 @@ class RolloutStorage:
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
+        # For PPO with Teacher Student
+        if "TS" in self.training_type:
+            switch = self.switch.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -161,13 +180,15 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                if "TS" in self.training_type:
+                    switch_batch = switch[batch_idx]
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
                 masks_batch = None
 
                 # Yield the mini-batch
-                yield (
+                batch = (
                     obs_batch,
                     actions_batch,
                     target_values_batch,
@@ -182,10 +203,13 @@ class RolloutStorage:
                     ),
                     masks_batch,
                 )
+                if "TS" in self.training_type:
+                    batch += (switch_batch,)
+                yield batch
 
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type != "rl":
+        if "rl" not in self.training_type:
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
 
