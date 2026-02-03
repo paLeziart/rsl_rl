@@ -197,7 +197,7 @@ class OnPolicyRunner:
         .. note::
             See :func:`resolve_obs_groups` for more details on the handling of observation sets.
         """
-        default_sets = ["critic"]
+        default_sets = []  # ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         return default_sets
