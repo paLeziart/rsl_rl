@@ -498,8 +498,56 @@ class PPOCat(PPO):
         ]
 
         self.optimizer_student = optim.Adam(params, lr=learning_rate)
+
+        """
+
+        for name, param in self.policy.named_parameters():
+            print(
+                name,
+                param.shape,
+                param.requires_grad,
+                param.device
+            )
+
+        L = [self.policy.std,
+             self.policy.actor,
+             self.policy.actor_obs_normalizer,
+             self.policy.critic,
+             self.policy.critic_obs_normalizer,
+             self.policy.teacher,
+             self.policy.teacher_obs_normalizer,
+             self.policy.student,
+             self.policy.student_obs_normalizer]
+
+        print("===")
+        for net in L:
+            for param in net.parameters():
+                print(
+                    param.shape,
+                    param.requires_grad,
+                    param.device
+                )
+        quit()
         # Create the optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(
+            list(self.policy.actor.parameters())
+            + list(self.policy.actor_obs_normalizer.parameters())
+            + list(self.policy.critic.parameters())
+            + list(self.policy.critic_obs_normalizer.parameters())
+            + list(self.policy.teacher.parameters())
+            + list(self.policy.teacher_obs_normalizer.parameters())
+            + list(self.policy.student.parameters())
+            + list(self.policy.student_obs_normalizer.parameters()),
+            lr=learning_rate,
+        )
+        #self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        #print(self.policy.parameters())
+        #from IPython import embed
+        #embed()
+        #quit()
+
+        self.optimizer_student = optim.Adam(list(self.policy.student.parameters()), lr=learning_rate)
+        """
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
