@@ -185,7 +185,7 @@ class ActorCriticTeacherStudent(nn.Module):
         self._update_distribution(obs)
         return self.distribution.sample()
 
-    def act_inference(self, obs: TensorDict, switch: torch.Tensor) -> torch.Tensor:
+    def act_inference(self, obs: TensorDict, switch: torch.Tensor | None = None) -> torch.Tensor:
         obs = self.get_actor_obs(obs, switch)
         obs = self.actor_obs_normalizer(obs)
         if self.state_dependent_std:
@@ -215,7 +215,7 @@ class ActorCriticTeacherStudent(nn.Module):
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["privileged"]]
         return torch.cat(obs_list, dim=-1)
 
-    def get_actor_obs(self, obs: TensorDict, switch: torch.Tensor) -> torch.Tensor:
+    def get_actor_obs(self, obs: TensorDict, switch: torch.Tensor | None = None) -> torch.Tensor:
         obs_proprio = self.get_proprio_obs(obs)
         obs_proprio_noised = self.get_proprio_obs_noised(obs)
         obs_proprio_hist = self.get_proprio_hist_obs(obs)
@@ -225,16 +225,31 @@ class ActorCriticTeacherStudent(nn.Module):
         obs_student = self.student_obs_normalizer(obs_proprio_hist)
         obs_teacher = self.teacher_obs_normalizer(torch.cat([obs_proprio, obs_privileged], dim=-1))
 
-        latent_student = self.student(obs_student)
-        latent_teacher = self.teacher(obs_teacher)
+        latent_student = torch.nn.functional.normalize(self.student(obs_student), dim=-1)
+        latent_teacher = torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
 
-        # Mixed actor input: do not backprop into student
-        obs = torch.cat([obs_proprio_noised, latent_teacher], dim=-1)
-        obs[switch[:, 0]] = (torch.cat([obs_proprio_noised, latent_student], dim=-1)[switch[:, 0]]).detach()
+        if switch is not None:
+            # Mixed actor input: do not backprop into student
+            obs = torch.cat([obs_proprio_noised, latent_teacher], dim=-1)
+            obs[switch[:, 0]] = (torch.cat([obs_proprio_noised, latent_student], dim=-1)[switch[:, 0]]).detach()
+        else:
+            # obs = torch.cat([obs_proprio_noised, latent_teacher], dim=-1).detach()
+            obs = torch.cat([obs_proprio_noised, latent_student], dim=-1).detach()
         return obs
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def get_latent_student(self, obs: TensorDict) -> torch.Tensor:
+        obs_proprio_hist = self.get_proprio_hist_obs(obs)
+        obs_student = self.student_obs_normalizer(obs_proprio_hist)
+        return torch.nn.functional.normalize(self.student(obs_student), dim=-1)
+
+    def get_latent_teacher(self, obs: TensorDict) -> torch.Tensor:
+        obs_proprio = self.get_proprio_obs(obs)
+        obs_privileged = self.get_privileged_obs(obs)
+        obs_teacher = self.teacher_obs_normalizer(torch.cat([obs_proprio, obs_privileged], dim=-1))
+        return torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
 
     def update_normalization(self, obs: TensorDict, switch: torch.Tensor) -> None:
         if self.teacher_obs_normalization:
