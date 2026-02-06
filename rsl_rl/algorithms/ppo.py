@@ -476,6 +476,28 @@ class PPOCat(PPO):
 
         # list(self.policy.actor.parameters()) + list(self.policy.critic.parameters()) + list(self.policy.teacher.parameters())
 
+        # for name, param in self.policy.named_parameters():
+        #     print(
+        #         name,
+        #         param.shape,
+        #         param.requires_grad,
+        #         param.device
+        #     )
+        # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+
+        params = [
+            p for name, p in self.policy.named_parameters()
+            if not name.startswith("student")
+        ]
+
+        self.optimizer = optim.Adam(params, lr=learning_rate)
+
+        params = [
+            p for name, p in self.policy.named_parameters()
+            if name.startswith("student")
+        ]
+
+        self.optimizer_student = optim.Adam(params, lr=learning_rate)
         # Create the optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
@@ -573,6 +595,9 @@ class PPOCatTeacherStudent(PPOCat):
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        mean_student_loss = 0
+        mean_teacher_norm = 0
+        mean_student_norm = 0
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -629,6 +654,10 @@ class PPOCatTeacherStudent(PPOCat):
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+
+            # Get student and teacher encodings
+            latent_student = self.policy.get_latent_student(obs_batch)
+            latent_teacher = self.policy.get_latent_teacher(obs_batch)
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -738,6 +767,10 @@ class PPOCatTeacherStudent(PPOCat):
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
+            # Student encoder loss
+            mseloss = torch.nn.MSELoss()
+            student_loss = mseloss(latent_student, latent_teacher.detach())
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -745,6 +778,9 @@ class PPOCatTeacherStudent(PPOCat):
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
+            # Compute the gradients for the student encoder
+            self.optimizer_student.zero_grad()
+            student_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -756,6 +792,8 @@ class PPOCatTeacherStudent(PPOCat):
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
+            # Apply the gradients for student encoder
+            self.optimizer_student.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -767,6 +805,11 @@ class PPOCatTeacherStudent(PPOCat):
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # Encoder loss
+            mean_student_loss += student_loss.item()
+
+            mean_teacher_norm += torch.norm(latent_teacher, dim=-1).mean().item()
+            mean_student_norm += torch.norm(latent_student, dim=-1).mean().item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -777,6 +820,9 @@ class PPOCatTeacherStudent(PPOCat):
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        mean_student_loss /= num_updates
+        mean_teacher_norm /= num_updates
+        mean_student_norm /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -791,5 +837,8 @@ class PPOCatTeacherStudent(PPOCat):
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        loss_dict["student"] = mean_student_loss
+        loss_dict["teacher_norm"] = mean_teacher_norm
+        loss_dict["student_norm"] = mean_student_norm
 
         return loss_dict
