@@ -42,8 +42,12 @@ class Logger:
         # Create buffers
         self.ep_extras = []
         self.rewbuffer = deque(maxlen=100)
+        self.rewbuffer_teacher = deque(maxlen=100)
+        self.rewbuffer_student = deque(maxlen=100)
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.cur_reward_teacher_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.cur_reward_student_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # Create RND buffers
@@ -101,6 +105,17 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+
+            if "switch" in extras:
+                switch: torch.Tensor = extras["switch"].flatten()
+                self.cur_reward_teacher_sum[~switch] += rewards[~switch]
+                self.cur_reward_student_sum[switch] += rewards[switch]
+                new_teacher_ids = torch.logical_and(dones > 0, ~switch).nonzero(as_tuple=False)
+                new_student_ids = torch.logical_and(dones > 0, switch).nonzero(as_tuple=False)
+                self.rewbuffer_teacher.extend(self.cur_reward_teacher_sum[new_teacher_ids][:, 0].cpu().numpy().tolist())
+                self.rewbuffer_student.extend(self.cur_reward_student_sum[new_student_ids][:, 0].cpu().numpy().tolist())
+                self.cur_reward_teacher_sum[new_teacher_ids] = 0
+                self.cur_reward_student_sum[new_student_ids] = 0
 
     def log(
         self,
@@ -177,6 +192,11 @@ class Logger:
                     self.writer.add_scalar(
                         "Train/mean_episode_length/time", statistics.mean(self.lenbuffer), int(self.tot_time)
                     )
+
+            if len(self.rewbuffer_teacher) > 0:
+                self.writer.add_scalar("Train/mean_reward_teacher", statistics.mean(self.rewbuffer_teacher), it)
+            if len(self.rewbuffer_student) > 0:
+                self.writer.add_scalar("Train/mean_reward_student", statistics.mean(self.rewbuffer_student), it)
 
             # Print to console
             log_string = f"""{"#" * width}\n"""
