@@ -11,6 +11,31 @@ from typing import Any, NoReturn
 from rsl_rl.networks import MLP, EmpiricalNormalization
 
 
+"""
+# normalize before MSE
+z_s = F.normalize(z_s, dim=1)
+z_t = F.normalize(z_t, dim=1)
+
+loss = F.mse_loss(z_s, z_t)
+
+# Try out
+loss = MSE(norm(zs), norm(zt)) + k * MSE(norm(hs), norm(ht)) with k = 0.1
+
+"""
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim=32, hidden_dim=64, out_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x : torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class ActorCriticTeacherStudent(nn.Module):
     is_recurrent: bool = False
 
@@ -225,8 +250,8 @@ class ActorCriticTeacherStudent(nn.Module):
         obs_student = self.student_obs_normalizer(obs_proprio_hist)
         obs_teacher = self.teacher_obs_normalizer(torch.cat([obs_proprio, obs_privileged], dim=-1))
 
-        latent_student = torch.nn.functional.normalize(self.student(obs_student), dim=-1)
-        latent_teacher = torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
+        latent_student = self.student(obs_student)  # torch.nn.functional.normalize(self.student(obs_student), dim=-1)
+        latent_teacher = self.teacher(obs_teacher)  # torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
 
         if switch is not None:
             # Mixed actor input: do not backprop into student
@@ -243,13 +268,15 @@ class ActorCriticTeacherStudent(nn.Module):
     def get_latent_student(self, obs: TensorDict) -> torch.Tensor:
         obs_proprio_hist = self.get_proprio_hist_obs(obs)
         obs_student = self.student_obs_normalizer(obs_proprio_hist)
-        return torch.nn.functional.normalize(self.student(obs_student), dim=-1)
+        return self.student(obs_student)
+        # return torch.nn.functional.normalize(self.student(obs_student), dim=-1)
 
     def get_latent_teacher(self, obs: TensorDict) -> torch.Tensor:
         obs_proprio = self.get_proprio_obs(obs)
         obs_privileged = self.get_privileged_obs(obs)
         obs_teacher = self.teacher_obs_normalizer(torch.cat([obs_proprio, obs_privileged], dim=-1))
-        return torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
+        return self.teacher(obs_teacher)
+        # return torch.nn.functional.normalize(self.teacher(obs_teacher), dim=-1)
 
     def update_normalization(self, obs: TensorDict, switch: torch.Tensor) -> None:
         if self.teacher_obs_normalization:

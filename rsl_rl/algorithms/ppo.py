@@ -657,6 +657,12 @@ class PPOCatTeacherStudent(PPOCat):
             latent_student = self.policy.get_latent_student(obs_batch)
             latent_teacher = self.policy.get_latent_teacher(obs_batch)
 
+            mean_teacher_norm += torch.norm(latent_teacher, dim=-1).mean().item()
+            mean_student_norm += torch.norm(latent_student, dim=-1).mean().item()
+
+            # latent_student = torch.nn.functional.normalize(latent_student, dim=-1)
+            # latent_teacher = torch.nn.functional.normalize(latent_teacher, dim=-1)
+
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
@@ -767,7 +773,9 @@ class PPOCatTeacherStudent(PPOCat):
 
             # Student encoder loss
             mseloss = torch.nn.MSELoss()
-            student_loss = mseloss(latent_student, latent_teacher.detach())
+            normed_latent_student = torch.nn.functional.normalize(latent_student, dim=-1)
+            normed_latent_teacher = torch.nn.functional.normalize(latent_teacher, dim=-1)
+            student_loss = mseloss(normed_latent_student, normed_latent_teacher.detach())
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -806,8 +814,7 @@ class PPOCatTeacherStudent(PPOCat):
             # Encoder loss
             mean_student_loss += student_loss.item()
 
-            mean_teacher_norm += torch.norm(latent_teacher, dim=-1).mean().item()
-            mean_student_norm += torch.norm(latent_student, dim=-1).mean().item()
+            
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
