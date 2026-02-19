@@ -18,6 +18,7 @@ class OnPolicyRunnerCaT(OnPolicyRunner):
     """The actor-critic algorithm with Constraints as Terminations."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
+        """Construct the runner, algorithm, and logging stack."""
         self.env = env
         self.cfg = train_cfg
         self.device = device

@@ -5,6 +5,12 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+from rsl_rl.env import VecEnv
+from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.models import MLPModel
+from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import resolve_callable, resolve_obs_groups
+
 from .ppo import PPO
 
 
@@ -51,3 +57,39 @@ class PPOCaT(PPO):
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+    @staticmethod
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPOCaT:
+        """Construct the PPO algorithm."""
+        # Resolve class callables
+        alg_class: type[PPOCaT] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
+        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
+        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
+
+        # Resolve observation groups
+        default_sets = ["actor", "critic"]
+        if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
+            default_sets.append("rnd_state")
+        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+
+        # Resolve RND config if used
+        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+
+        # Resolve symmetry config if used
+        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+
+        # Initialize the policy
+        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        print(f"Actor Model: {actor}")
+        if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
+            cfg["critic"]["cnns"] = actor.cnns  # type: ignore
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+        print(f"Critic Model: {critic}")
+
+        # Initialize the storage
+        storage = RolloutStorage("rl-CaT", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+
+        # Initialize the algorithm
+        alg: PPOCaT = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+
+        return alg

@@ -63,6 +63,10 @@ class RolloutStorage:
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
             """Hidden states for recurrent networks, e.g., (actor, critic)."""
 
+            # For teacher student
+            self.switch: torch.Tensor | None = None
+            """Switch from teacher to student latents."""
+
         def clear(self) -> None:
             """Reset all transition fields to None."""
             self.__init__()
@@ -87,6 +91,7 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            switch: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -124,6 +129,10 @@ class RolloutStorage:
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+
+            # For teacher student
+            self.switch: torch.Tensor | None = switch
+            """Switch from teacher to student latents."""
 
     def __init__(
         self,
@@ -168,6 +177,10 @@ class RolloutStorage:
         if "CaT" in training_type:
             self.cstr_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
+        # For reinforcement learning with teacher-student mix
+        if "TS" in training_type:
+            self.switch = torch.zeros(num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=self.device)
+
         # For recurrent networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
@@ -186,14 +199,13 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
-        self.cstr_dones[self.step].copy_(transition.cstr_dones.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)  # type: ignore
 
         # For reinforcement learning
-        if self.training_type == "rl":
+        if "rl" in self.training_type:
             self.values[self.step].copy_(transition.values)  # type: ignore
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             if self.distribution_params is None:  # Initialize the distribution parameters
@@ -203,6 +215,14 @@ class RolloutStorage:
                 )
             for i, p in enumerate(transition.distribution_params):  # type: ignore
                 self.distribution_params[i][self.step].copy_(p)
+
+        # For reinforcement learning with constraints as terminations
+        if "CaT" in self.training_type:
+            self.cstr_dones[self.step].copy_(transition.cstr_dones.view(-1, 1))
+
+        # For reinforcement learning with teacher-student mix
+        if "TS" in self.training_type:
+            self.switch[self.step].copy_(transition.switch.view(-1, 1))
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -245,6 +265,9 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
+        # For PPO with Teacher Student
+        switch = self.switch.flatten(0, 1) if "TS" in self.training_type else None
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -261,6 +284,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    switch=switch[batch_idx] if switch else None
                 )
 
     # For reinforcement learning with recurrent networks
