@@ -28,6 +28,7 @@ class PPOCaT(PPO):
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
+        """Record one environment step and update the normalizers."""
         # Record the constraint probability factor that affects the discounted
         # sum of rewards depending on constraint violations.
         self.transition.cstr_dones = extras["cstr_probs"]
@@ -35,6 +36,7 @@ class PPOCaT(PPO):
         super().process_env_step(obs, rewards, dones, extras)
 
     def compute_returns(self, obs: TensorDict) -> None:
+        """Compute return and advantage targets from stored transitions."""
         st = self.storage
         # Compute value for the last step
         last_values = self.critic(obs).detach()
