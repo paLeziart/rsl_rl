@@ -52,12 +52,19 @@ class PPOCaTTeacherStudent(PPOCaT):
             self.student.parameters(), lr=learning_rate
         )  # type: ignore
 
+    def compute_latent(self, obs: TensorDict, switch: torch.Tensor) -> None:
+        """Compute the latent space information and store it in obs["latent"]."""
+        # Mixed actor input: do not backprop into student
+        latent_obs = self.teacher(obs)
+        latent_obs[switch[:, 0]] = (self.student(obs)[switch[:, 0]]).detach()
+        obs["latent"] = latent_obs * 0.0 + 0.1
+
     def act(self, obs: TensorDict, switch: torch.Tensor) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True, switch=switch).detach()
+        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
@@ -126,6 +133,9 @@ class PPOCaTTeacherStudent(PPOCaT):
                 batch.values = batch.values.repeat(num_aug, 1)
                 batch.advantages = batch.advantages.repeat(num_aug, 1)
                 batch.returns = batch.returns.repeat(num_aug, 1)
+
+            # Compute the latent space with the teacher-student mix
+            self.compute_latent(batch.observations, batch.switch)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
@@ -424,9 +434,9 @@ class PPOCaTTeacherStudent(PPOCaT):
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
-        teacher: MLPModel = teacher_class(obs, cfg["obs_groups"], "teacher", 1, **cfg["teacher"]).to(device)
+        teacher: MLPModel = teacher_class(obs, cfg["obs_groups"], "teacher", cfg["actor"]["latent_dim"], **cfg["teacher"]).to(device)
         print(f"Teacher Model: {teacher}")
-        student: MLPModel = student_class(obs, cfg["obs_groups"], "student", 1, **cfg["student"]).to(device)
+        student: MLPModel = student_class(obs, cfg["obs_groups"], "student", cfg["actor"]["latent_dim"], **cfg["student"]).to(device)
         print(f"Student Model: {student}")
 
         # Initialize the storage
