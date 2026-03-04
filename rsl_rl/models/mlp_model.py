@@ -63,6 +63,11 @@ class MLPModel(nn.Module):
         else:
             self.obs_normalizer = torch.nn.Identity()
 
+        # TEMPORARY FIX
+        if output_dim == 19:
+            print("\033[91m== Manually adding distribution to actor == \033[0m")
+            distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
+
         # Distribution
         if distribution_cfg is not None:
             dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
