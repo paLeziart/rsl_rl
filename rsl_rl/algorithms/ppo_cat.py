@@ -80,6 +80,12 @@ class PPOCaT(PPO):
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
+        from mjlab.utils.logging import print_info
+        print_info("== Manually popping deprecated parameters ==", "red")
+        for net in ["actor", "critic"]:
+            for name in ["init_noise_std", "noise_std_type", "stochastic"]:
+                cfg[net].pop(name)
+
         # Initialize the policy
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
         print(f"Actor Model: {actor}")
