@@ -284,7 +284,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
-                    switch=switch[batch_idx] if switch else None
+                    switch=switch[batch_idx] if switch is not None else None
                 )
 
     # For reinforcement learning with recurrent networks
