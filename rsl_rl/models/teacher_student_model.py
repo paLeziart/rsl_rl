@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
+from collections import defaultdict
 from tensordict import TensorDict
 from typing import Any
 
@@ -17,8 +18,8 @@ from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 
-class MLPModel(nn.Module):
-    """MLP-based neural model.
+class TeacherStudentModel(nn.Module):
+    """TeacherStudent-based neural model.
 
     This model uses a simple multi-layer perceptron (MLP) to process 1D observation groups. Observations can be
     normalized before being passed to the MLP. The output of the model can be either deterministic or
@@ -32,13 +33,15 @@ class MLPModel(nn.Module):
         self,
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
-        obs_set: str,
+        obs_set: dict[str, str],
         output_dim: int,
+        latent_dim: int,
         hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
+        encoder_dims: tuple[int, ...] | list[int] = (128, 64),
         activation: str = "elu",
-        obs_normalization: bool = False,
+        obs_normalization: dict[str, bool] = defaultdict(bool),
         distribution_cfg: dict | None = None,
-        last_layernorm: bool = False,
+        encoder_layernorm: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -47,44 +50,60 @@ class MLPModel(nn.Module):
             obs_groups: Dictionary mapping observation sets to lists of observation groups.
             obs_set: Observation set to use for this model (e.g., "actor" or "critic").
             output_dim: Dimension of the output.
-            hidden_dims: Hidden dimensions of the MLP.
-            activation: Activation function of the MLP.
-            obs_normalization: Whether to normalize the observations before feeding them to the MLP.
+            latent_dim: Dimension of the latent space (output of the encoders).
+            hidden_dims: Hidden dimensions of the actor MLP.
+            encoder_dims: Hidden dimensions of the teacher-student encoders.
+            activation: Activation function of the MLPs.
+            obs_normalization: Whether to normalize the observations before feeding them to the actor-teacher-student.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            encoder_layernorm: Whether to include a LayerNorm layer at the end of the teacher-student encoders.
         """
         super().__init__()
 
         # Resolve observation groups and dimensions
-        self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
+        self.obs_groups, obs_dim = {}, {}
+        for name in ["actor", "teacher", "student"]:
+            print(obs_groups)
+            self.obs_groups[name], obs_dim[name] = self._get_obs_dim(obs, obs_groups, obs_set[name])
+
+        self.obs_groups["actor"] = (*self.obs_groups["actor"], "latent")
+        obs_dim["actor"] += latent_dim
 
         # Observation normalization
-        self.obs_normalization = obs_normalization
-        if obs_normalization:
-            self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-        else:
-            self.obs_normalizer = torch.nn.Identity()
+        # Could use a dict but then we would have to overload some nn.Module methods
+        self.obs_normalization, self.obs_normalizer = obs_normalization, {}
+        self.actor_normalizer = (
+            EmpiricalNormalization(obs_dim["actor"]) if obs_normalization["actor"] else torch.nn.Identity()
+        )
+        self.teacher_normalizer = (
+            EmpiricalNormalization(obs_dim["teacher"]) if obs_normalization["teacher"] else torch.nn.Identity()
+        )
+        self.student_normalizer = (
+            EmpiricalNormalization(obs_dim["student"]) if obs_normalization["student"] else torch.nn.Identity()
+        )
 
         # TEMPORARY FIX
-        if output_dim == 19:
-            print("\033[91m== Manually adding distribution to actor == \033[0m")
-            distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
+        print("\033[91m== Manually adding distribution to actor == \033[0m")
+        distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
 
         # Distribution
         if distribution_cfg is not None:
             dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
             self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
-            mlp_output_dim = self.distribution.input_dim
+            actor_output_dim = self.distribution.input_dim
         else:
             self.distribution = None
-            mlp_output_dim = output_dim
+            actor_output_dim = output_dim
 
-        # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation, last_layernorm=last_layernorm)
+        # MLPs
+        self.actor = MLP(obs_dim["actor"], actor_output_dim, hidden_dims, activation)
+        self.teacher = MLP(obs_dim["teacher"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
+        self.student = MLP(obs_dim["student"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
-            self.distribution.init_mlp_weights(self.mlp)
+            self.distribution.init_mlp_weights(self.actor)
 
     def forward(
         self,
@@ -92,8 +111,9 @@ class MLPModel(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
+        switch: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass of the MLP model.
+        """Forward pass of the Teacher-Student model.
 
         ..note::
             The `stochastic_output` flag only has an effect if the model has a distribution (i.e., ``distribution_cfg``
@@ -103,9 +123,20 @@ class MLPModel(nn.Module):
         # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
         # Get MLP input latent
-        latent = self.get_latent(obs, masks, hidden_state)
+        teacher_obs = self.get_observations(obs, "teacher", masks, hidden_state)
+        student_obs = self.get_observations(obs, "student", masks, hidden_state)
+        if switch is not None:
+            # Mixed actor input: do not backprop into student
+            obs["latent"] = self.teacher(teacher_obs)
+            obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
+        else:
+            # Only student for deployment
+            print("\033[92m= Latent space only computed by student = \033[0m")
+            obs["latent"] = self.student(student_obs)
+
+        actor_obs = self.get_observations(obs, "actor", masks, hidden_state)
         # MLP forward pass
-        mlp_output = self.mlp(latent)
+        mlp_output = self.actor(actor_obs)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
@@ -114,15 +145,23 @@ class MLPModel(nn.Module):
             return self.distribution.deterministic_output(mlp_output)
         return mlp_output
 
-    def get_latent(
-        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+    def get_observations(
+        self, obs: TensorDict, name: str, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         """Build the model latent by concatenating and normalizing selected observation groups."""
         # Select and concatenate observations
-        obs_list = [obs[obs_group] for obs_group in self.obs_groups]
+        obs_list = [obs[obs_group] for obs_group in self.obs_groups[name]]
         latent = torch.cat(obs_list, dim=-1)
         # Normalize observations
-        latent = self.obs_normalizer(latent)
+        # This would be better with a dict but we'd have to overload some nn.module functions to act on dict
+        if name == "actor":
+            latent = self.actor_normalizer(latent)
+        elif name == "student":
+            latent = self.student_normalizer(latent)
+        elif name == "teacher":
+            latent = self.teacher_normalizer(latent)
+        else:
+            raise NotImplementedError
         return latent
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
@@ -169,20 +208,49 @@ class MLPModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
-        return _TorchMLPModel(self)
+        return _TorchTeacherStudentModel(self)
 
     def as_onnx(self, verbose: bool) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxMLPModel(self, verbose)
+        return _OnnxTeacherStudentModel(self, verbose)
 
-    def update_normalization(self, obs: TensorDict) -> None:
+    def update_normalization(self, obs: TensorDict, switch: torch.Tensor | None = None) -> None:
         """Update observation-normalization statistics from a batch of observations."""
-        if self.obs_normalization:
+        if any(self.obs_normalization.values()):
             # Select and concatenate observations
-            obs_list = [obs[obs_group] for obs_group in self.obs_groups]
-            mlp_obs = torch.cat(obs_list, dim=-1)
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups["teacher"]]
+            teacher_obs = torch.cat(obs_list, dim=-1)
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups["student"]]
+            student_obs = torch.cat(obs_list, dim=-1)
+
             # Update the normalizer parameters
-            self.obs_normalizer.update(mlp_obs)  # type: ignore
+            if self.obs_normalization["teacher"]:
+                self.teacher_normalizer.update(teacher_obs)  # type: ignore
+            if self.obs_normalization["student"]:
+                self.student_normalizer.update(student_obs)  # type: ignore
+
+            # No need to go further if actor obs are not normalized
+            if not self.obs_normalization["actor"]:
+                return
+
+            # Normalize observations
+            teacher_obs = self.teacher_normalizer(teacher_obs)
+            student_obs = self.student_normalizer(student_obs)
+
+            if switch is not None:
+                # Mixed actor input: do not backprop into student
+                obs["latent"] = self.teacher(teacher_obs)
+                obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
+            else:
+                # Only student for deployment
+                print("\033[92m= Update actor normalizer with student latent only = \033[0m")
+                obs["latent"] = self.student(student_obs)
+
+            # Select and concatenate observations (for actor)
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups["actor"]]
+            mlp_obs = torch.cat(obs_list, dim=-1)
+            # Update the normalizer parameters (for actor)
+            self.actor_normalizer.update(mlp_obs)  # type: ignore
 
     def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
         """Select active observation groups and compute observation dimension."""
@@ -196,15 +264,11 @@ class MLPModel(nn.Module):
             obs_dim += obs[obs_group].shape[-1]
         return active_obs_groups, obs_dim
 
-    def _get_latent_dim(self) -> int:
-        """Return the latent dimensionality consumed by the MLP head."""
-        return self.obs_dim
 
-
-class _TorchMLPModel(nn.Module):
+class _TorchTeacherStudentModel(nn.Module):
     """Exportable MLP model for JIT."""
 
-    def __init__(self, model: MLPModel) -> None:
+    def __init__(self, model: TeacherStudentModel) -> None:
         """Create a TorchScript-friendly copy of an MLPModel."""
         super().__init__()
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
@@ -226,31 +290,35 @@ class _TorchMLPModel(nn.Module):
         pass
 
 
-class _OnnxMLPModel(nn.Module):
+class _OnnxTeacherStudentModel(nn.Module):
     """Exportable MLP model for ONNX."""
 
     is_recurrent: bool = False
 
-    def __init__(self, model: MLPModel, verbose: bool) -> None:
+    def __init__(self, model: TeacherStudentModel, verbose: bool) -> None:
         """Create an ONNX-export wrapper around an MLPModel."""
         super().__init__()
         self.verbose = verbose
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
-        self.mlp = copy.deepcopy(model.mlp)
+        self.actor = copy.deepcopy(model.actor)
+        self.actor_normalizer = copy.deepcopy(model.actor_normalizer)
+        self.student = copy.deepcopy(model.student)
+        self.student_normalizer = copy.deepcopy(model.student_normalizer)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
-        self.input_size = model.obs_dim
+        # self.input_size = model.obs_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference for ONNX export."""
+        raise NotImplementedError("\033[91mTodo ONNX export for TeacherStudent\033[0m")
         x = self.obs_normalizer(x)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor]:
         """Return representative dummy inputs for ONNX tracing."""
+        raise NotImplementedError("\033[91mTodo ONNX export for TeacherStudent\033[0m")
         return (torch.zeros(1, self.input_size),)
 
     @property
@@ -263,45 +331,3 @@ class _OnnxMLPModel(nn.Module):
         """Return ONNX output tensor names."""
         return ["actions"]
 
-
-class MLPModelWithLatent(MLPModel):
-    """MLP-based neural model with latent space."""
-
-    def __init__(self, *args: Any, latent_dim: int, **kwargs: Any) -> None:
-        """Initialize the MLP-based model with a latent space.
-
-        Args:
-            *args: The args to init the MLPModel with.
-            latent_dim: Dimension of the latent space.
-            **kwargs: The kwargs to init the MLPModel with.
-        """
-        self.latent_dim = latent_dim
-        super().__init__(*args, **kwargs)
-
-    # def get_latent(
-    #     self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
-    # ) -> torch.Tensor:
-    #     """Build the model latent by concatenating and normalizing selected observation groups."""
-    #     # Select and concatenate observations
-    #     obs_list = [obs[obs_group] for obs_group in [*self.obs_groups, "latent"]]
-    #     latent = torch.cat(obs_list, dim=-1)
-    #     # Normalize observations
-    #     latent = self.obs_normalizer(latent)
-    #     return latent
-
-    # def update_normalization(self, obs: TensorDict) -> None:
-    #     """Update observation-normalization statistics from a batch of observations."""
-    #     if self.obs_normalization:
-    #         # Select and concatenate observations
-    #         obs_list = [obs[obs_group] for obs_group in [*self.obs_groups, "latent"]]
-    #         mlp_obs = torch.cat(obs_list, dim=-1)
-    #         # Update the normalizer parameters
-    #         self.obs_normalizer.update(mlp_obs)  # type: ignore
-
-    def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
-        """Select active observation groups and compute observation dimension."""
-        # Resolve observation groups and dimensions
-        active_obs_groups, obs_dim = super()._get_obs_dim(obs, obs_groups, obs_set)
-        active_obs_groups = [*active_obs_groups, "latent"]
-        obs_dim += self.latent_dim
-        return active_obs_groups, obs_dim

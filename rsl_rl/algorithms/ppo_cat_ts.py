@@ -10,7 +10,7 @@ from typing import Any
 
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.models import MLPModel
+from rsl_rl.models import MLPModel, TeacherStudentModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -26,10 +26,8 @@ class PPOCaTTeacherStudent(PPOCaT):
 
     def __init__(
         self,
-        actor: MLPModel,
+        actor: TeacherStudentModel,
         critic: MLPModel,
-        teacher: MLPModel,
-        student: MLPModel,
         storage: RolloutStorage,
         learning_rate: float = 0.001,
         optimizer: str = "adam",
@@ -38,18 +36,14 @@ class PPOCaTTeacherStudent(PPOCaT):
 
         super().__init__(actor, critic, storage, learning_rate=learning_rate, **kwargs)
 
-        # Teacher Student components
-        self.teacher = teacher.to(self.device)
-        self.student = student.to(self.device)
-
         # Create the main PPO optimizer, including the teacher
         self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters(), self.teacher.parameters()), lr=learning_rate
+            chain(self.actor.actor.parameters(), self.critic.parameters(), self.actor.teacher.parameters()), lr=learning_rate
         )  # type: ignore
 
         # Create the optimizer for the student
         self.student_optimizer = resolve_optimizer(optimizer)(
-            self.student.parameters(), lr=learning_rate
+            self.actor.student.parameters(), lr=learning_rate
         )  # type: ignore
 
     def compute_latent(self, obs: TensorDict, switch: torch.Tensor) -> None:
@@ -64,7 +58,7 @@ class PPOCaTTeacherStudent(PPOCaT):
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+        self.transition.actions = self.actor(obs, stochastic_output=True, switch=switch).detach()
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
@@ -84,9 +78,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         # of only the teacher latent samples.
 
         super().process_env_step(obs, rewards, dones, extras)
-
-        self.teacher.reset(dones)
-        self.student.reset(dones)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -134,9 +125,6 @@ class PPOCaTTeacherStudent(PPOCaT):
                 batch.advantages = batch.advantages.repeat(num_aug, 1)
                 batch.returns = batch.returns.repeat(num_aug, 1)
 
-            # Compute the latent space with the teacher-student mix
-            self.compute_latent(batch.observations, batch.switch)
-
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
             self.actor(
@@ -144,6 +132,7 @@ class PPOCaTTeacherStudent(PPOCaT):
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
                 stochastic_output=True,
+                switch=batch.switch,
             )
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
@@ -152,8 +141,8 @@ class PPOCaTTeacherStudent(PPOCaT):
             entropy = self.actor.output_entropy[:original_batch_size]
 
             # Get student and teacher encodings
-            latent_student = self.student(batch.observations)
-            latent_teacher = self.teacher(batch.observations)
+            latent_student = self.actor.student(self.actor.get_observations(batch.observations, "student"))
+            latent_teacher = self.actor.teacher(self.actor.get_observations(batch.observations, "teacher"))
 
             mean_teacher_norm += torch.norm(latent_teacher, dim=-1).mean().item()
             mean_student_norm += torch.norm(latent_student, dim=-1).mean().item()
@@ -256,9 +245,7 @@ class PPOCaTTeacherStudent(PPOCaT):
 
             # Student encoder loss
             mseloss = torch.nn.MSELoss()
-            normed_latent_student = torch.nn.functional.normalize(latent_student, dim=-1)
-            normed_latent_teacher = torch.nn.functional.normalize(latent_teacher, dim=-1)
-            student_loss = mseloss(normed_latent_student, normed_latent_teacher.detach())
+            student_loss = mseloss(latent_student, latent_teacher.detach())
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -336,8 +323,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         self.critic.train()
         if self.rnd:
             self.rnd.train()
-        self.teacher.train()
-        self.student.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -345,8 +330,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
-        self.teacher.eval()
-        self.student.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -358,8 +341,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
-        saved_dict["teacher_state_dict"] = self.teacher.state_dict()
-        saved_dict["student_state_dict"] = self.student.state_dict()
         saved_dict["student_optimizer_state_dict"] = self.student_optimizer.state_dict()
         return saved_dict
 
@@ -380,6 +361,7 @@ class PPOCaTTeacherStudent(PPOCaT):
         # Load the specified models
         if load_cfg.get("actor"):
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            self.student_optimizer.load_state_dict(loaded_dict["student_optimizer_state_dict"])
         if load_cfg.get("critic"):
             self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
@@ -387,14 +369,9 @@ class PPOCaTTeacherStudent(PPOCaT):
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-        if load_cfg.get("teacher"):
-            self.teacher.load_state_dict(loaded_dict["teacher_state_dict"], strict=strict)
-        if load_cfg.get("student"):
-            self.student.load_state_dict(loaded_dict["student_state_dict"], strict=strict)
-            self.student_optimizer.load_state_dict(loaded_dict["student_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
-    def get_policy(self) -> MLPModel:
+    def get_policy(self) -> TeacherStudentModel:
         """Get the policy model."""
         # TODO: Properly return actor/teacher/student
         return self.actor
@@ -404,10 +381,8 @@ class PPOCaTTeacherStudent(PPOCaT):
         """Construct the PPO algorithm."""
         # Resolve class callables
         alg_class: type[PPOCaTTeacherStudent] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
-        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
+        actor_class: type[TeacherStudentModel] = resolve_callable(cfg["actor_teacher_student"].pop("class_name"))  # type: ignore
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
-        teacher_class: type[MLPModel] = resolve_callable(cfg["teacher"].pop("class_name"))  # type: ignore
-        student_class: type[MLPModel] = resolve_callable(cfg["student"].pop("class_name"))  # type: ignore
 
         # Resolve observation groups
         default_sets = ["actor", "critic", "teacher", "student"]
@@ -423,27 +398,32 @@ class PPOCaTTeacherStudent(PPOCaT):
 
         from mjlab.utils.logging import print_info
         print_info("== Manually popping deprecated parameters ==", "red")
-        for net in ["actor", "critic", "teacher", "student"]:
+        cfg.pop("actor")
+        for net in ["critic"]:
             for name in ["init_noise_std", "noise_std_type", "stochastic"]:
                 cfg[net].pop(name)
 
         # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
-        print(f"Actor Model: {actor}")
+        obs_sets = {"actor": "actor", "teacher": "teacher", "student": "student"}
+        actor: TeacherStudentModel = actor_class(
+            obs, cfg["obs_groups"], obs_sets, env.num_actions, **cfg["actor_teacher_student"]
+        ).to(device)
+        print(f"Actor Model: {actor.actor}")
+        print(f"with normalizer: {actor.actor_normalizer}")
+        print(f"Teacher Model: {actor.teacher}")
+        print(f"with normalizer: {actor.teacher_normalizer}")
+        print(f"Student Model: {actor.student}")
+        print(f"with normalizer: {actor.student_normalizer}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
-        teacher: MLPModel = teacher_class(obs, cfg["obs_groups"], "teacher", cfg["actor"]["latent_dim"], **cfg["teacher"]).to(device)
-        print(f"Teacher Model: {teacher}")
-        student: MLPModel = student_class(obs, cfg["obs_groups"], "student", cfg["actor"]["latent_dim"], **cfg["student"]).to(device)
-        print(f"Student Model: {student}")
 
         # Initialize the storage
         storage = RolloutStorage("rl-CaT-TS", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
-        alg: PPOCaTTeacherStudent = alg_class(actor, critic, teacher, student, storage, device=device,
+        alg: PPOCaTTeacherStudent = alg_class(actor, critic, storage, device=device,
                                               **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
         return alg
@@ -454,7 +434,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         model_params = [self.actor.state_dict(), self.critic.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
-        model_params += [self.teacher.state_dict(), self.student.state_dict()]
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
@@ -462,8 +441,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         self.critic.load_state_dict(model_params[1])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
-        self.teacher.load_state_dict(model_params[-2])
-        self.student.load_state_dict(model_params[-1])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -474,7 +451,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         all_params = chain(self.actor.parameters(), self.critic.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
-        all_params = chain(all_params, self.teacher.parameters(), self.student.parameters())
         all_params = list(all_params)
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
         all_grads = torch.cat(grads)

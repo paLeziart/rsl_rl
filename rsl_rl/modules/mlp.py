@@ -31,6 +31,7 @@ class MLP(nn.Sequential):
         hidden_dims: tuple[int, ...] | list[int],
         activation: str = "elu",
         last_activation: str | None = None,
+        last_layernorm: bool = False,
     ) -> None:
         """Initialize the MLP.
 
@@ -72,6 +73,9 @@ class MLP(nn.Sequential):
         # Add last activation function if specified
         if last_activation_mod is not None:
             layers.append(last_activation_mod)
+
+        if last_layernorm:
+            layers.append(nn.LayerNorm(output_dim))
 
         # Register the layers
         for idx, layer in enumerate(layers):

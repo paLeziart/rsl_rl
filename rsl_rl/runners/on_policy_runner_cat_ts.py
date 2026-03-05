@@ -59,7 +59,6 @@ class OnPolicyRunnerCaTTeacherStudent(OnPolicyRunnerCaT):
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         switch = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
-        self.alg.compute_latent(obs, switch)  # Compute the latent space with the teacher-student mix
         for it in range(start_it, total_it):
             start = time.time()
             if it % 20 == 0:
@@ -77,7 +76,6 @@ class OnPolicyRunnerCaTTeacherStudent(OnPolicyRunnerCaT):
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     extras["switch"] = switch  # Store who controlled the envs (either student or teacher)
-                    self.alg.compute_latent(obs, switch)  # Compute the latent space with the teacher-student mix
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
