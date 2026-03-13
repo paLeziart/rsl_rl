@@ -13,7 +13,7 @@ from collections import defaultdict
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState, StudentEncoder, TeacherEncoder
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
@@ -98,8 +98,11 @@ class TeacherStudentModel(nn.Module):
 
         # MLPs
         self.actor = MLP(obs_dim["actor"], actor_output_dim, hidden_dims, activation)
-        self.teacher = MLP(obs_dim["teacher"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
-        self.student = MLP(obs_dim["student"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
+        # self.teacher = MLP(obs_dim["teacher"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
+        # self.student = MLP(obs_dim["student"], latent_dim, encoder_dims, activation, last_layernorm=encoder_layernorm)
+
+        self.teacher = TeacherEncoder(obs_dim["teacher"], encoder_dims, latent_dim)
+        self.student = StudentEncoder([12, 12, 76, 76, 76, 12, 12], 4, 64, latent_dim, False)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
@@ -111,7 +114,8 @@ class TeacherStudentModel(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
-        switch: torch.Tensor | None = None,
+        alpha: float = 0.0,
+        with_latent_norm: bool = False,
     ) -> torch.Tensor:
         """Forward pass of the Teacher-Student model.
 
@@ -122,17 +126,50 @@ class TeacherStudentModel(nn.Module):
         """
         # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
+
+        # teacher_latent = self.teacher(self.get_observations(obs, "teacher", masks, hidden_state))
+        # obs["latent"] = teacher_latent
+        # print(alpha)
+
+        #print("Alpha: ", alpha)
+
         # Get MLP input latent
-        teacher_obs = self.get_observations(obs, "teacher", masks, hidden_state)
-        student_obs = self.get_observations(obs, "student", masks, hidden_state)
-        if switch is not None:
-            # Mixed actor input: do not backprop into student
-            obs["latent"] = self.teacher(teacher_obs)
-            obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
+        if alpha < 1:
+            if with_latent_norm:
+                teacher_latent, preLN_teacher_norm = self.teacher(self.get_observations(obs, "teacher", masks, hidden_state), with_norm=with_latent_norm)
+            else:
+                teacher_latent = self.teacher(self.get_observations(obs, "teacher", masks, hidden_state), with_norm=with_latent_norm)
         else:
-            # Only student for deployment
-            print("\033[92m= Latent space only computed by student = \033[0m")
-            obs["latent"] = self.student(student_obs)
+            preLN_teacher_norm = 0
+
+        if alpha > 0:
+            if with_latent_norm:
+                student_latent, preLN_student_norm = self.student(self.get_observations(obs, "student", masks, hidden_state), with_norm=with_latent_norm)
+            else:
+                student_latent = self.student(self.get_observations(obs, "student", masks, hidden_state), with_norm=with_latent_norm)
+        else:
+            preLN_student_norm = 0
+
+        if alpha == 0.0:
+            obs["latent"] = teacher_latent
+        elif alpha == 1.0:
+            obs["latent"] = student_latent
+        else:
+            obs["latent"] = alpha * student_latent + (1 - alpha) * teacher_latent
+
+        # teacher_obs = self.get_observations(obs, "teacher", masks, hidden_state)
+        # student_obs = self.get_observations(obs, "student", masks, hidden_state)
+        # if switch is not None:
+        #     # Mixed actor input: do not backprop into student
+        #     obs["latent"] = self.teacher(teacher_obs)
+        #     obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
+        # else:
+        #     # Only student for deployment
+        #     print("\033[92m= Latent space only computed by student = \033[0m")
+        #     obs["latent"] = self.student(student_obs)
+
+        # obs["latent"] = self.teacher(teacher_obs)
+        # obs["latent"] *= 0.0
 
         actor_obs = self.get_observations(obs, "actor", masks, hidden_state)
         # MLP forward pass
@@ -141,7 +178,10 @@ class TeacherStudentModel(nn.Module):
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
-                return self.distribution.sample()
+                if not with_latent_norm:
+                    return self.distribution.sample()
+                else:
+                    return self.distribution.sample(), preLN_teacher_norm, preLN_student_norm
             return self.distribution.deterministic_output(mlp_output)
         return mlp_output
 
@@ -235,16 +275,18 @@ class TeacherStudentModel(nn.Module):
 
             # Normalize observations
             teacher_obs = self.teacher_normalizer(teacher_obs)
-            student_obs = self.student_normalizer(student_obs)
+            # student_obs = self.student_normalizer(student_obs)
+            # if switch is not None:
+            #     # Mixed actor input: do not backprop into student
+            #     obs["latent"] = self.teacher(teacher_obs)
+            #     obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
+            # else:
+            #     # Only student for deployment
+            #     # print("\033[92m= Update actor normalizer with student latent only = \033[0m")
+            #     obs["latent"] = self.student(student_obs)
 
-            if switch is not None:
-                # Mixed actor input: do not backprop into student
-                obs["latent"] = self.teacher(teacher_obs)
-                obs["latent"][switch[:, 0]] = (self.student(student_obs)[switch[:, 0]]).detach()
-            else:
-                # Only student for deployment
-                print("\033[92m= Update actor normalizer with student latent only = \033[0m")
-                obs["latent"] = self.student(student_obs)
+            obs["latent"] = self.teacher(teacher_obs)
+            # obs["latent"] *= 0.0
 
             # Select and concatenate observations (for actor)
             obs_list = [obs[obs_group] for obs_group in self.obs_groups["actor"]]

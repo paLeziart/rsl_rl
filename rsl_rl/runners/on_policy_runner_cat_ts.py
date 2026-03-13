@@ -64,15 +64,16 @@ class OnPolicyRunnerCaTTeacherStudent(OnPolicyRunnerCaT):
             if it % 20 == 0:
                 off = 1000
                 num_switch = int(self.env.num_envs * max(0.0, min(1.0, (it - off) / (total_it - 3000))))
-                if num_switch > 0:
-                    switch[:num_switch] = True
                 print("= NEW NUM OF STUDENTS: ", num_switch)
+
+            # Refresh teacher-student mix and network optimizer
+            alpha = self.alg.update_training_mix(it, **self.cfg["algorithm"])
 
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
-                    actions = self.alg.act(obs, switch=switch)
+                    actions = self.alg.act(obs, alpha=alpha)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     extras["switch"] = switch  # Store who controlled the envs (either student or teacher)

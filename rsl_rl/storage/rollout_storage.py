@@ -179,7 +179,7 @@ class RolloutStorage:
 
         # For reinforcement learning with teacher-student mix
         if "TS" in training_type:
-            self.switch = torch.zeros(num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=self.device)
+            self.switch = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For recurrent networks
         self.saved_hidden_state_a = None
