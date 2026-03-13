@@ -10,6 +10,7 @@ from .distribution import Distribution, GaussianDistribution, HeteroscedasticGau
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
+from .teacher_student import StudentEncoder, TeacherEncoder
 
 __all__ = [
     "CNN",
@@ -21,4 +22,6 @@ __all__ = [
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "StudentEncoder",
+    "TeacherEncoder",
 ]
