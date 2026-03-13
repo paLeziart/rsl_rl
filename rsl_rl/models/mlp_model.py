@@ -66,7 +66,7 @@ class MLPModel(nn.Module):
         # TEMPORARY FIX
         if output_dim == 19:
             print("\033[91m== Manually adding distribution to actor == \033[0m")
-            distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
+            distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 0.6, "std_type": "scalar"}
 
         # Distribution
         if distribution_cfg is not None:
