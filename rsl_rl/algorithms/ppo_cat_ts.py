@@ -512,13 +512,6 @@ class PPOCaTTeacherStudent(PPOCaT):
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
-        from mjlab.utils.logging import print_info
-        print_info("== Manually popping deprecated parameters ==", "red")
-        cfg.pop("actor")
-        for net in ["critic"]:
-            for name in ["init_noise_std", "noise_std_type", "stochastic"]:
-                cfg[net].pop(name)
-
         # Initialize the policy
         obs_sets = {"actor": "actor", "teacher": "teacher", "student": "student"}
         actor: TeacherStudentModel = actor_class(
