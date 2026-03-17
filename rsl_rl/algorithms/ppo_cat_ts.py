@@ -105,6 +105,7 @@ class PPOCaTTeacherStudent(PPOCaT):
 
         mean_pre_teacher_norm = 0
         mean_pre_student_norm = 0
+        mean_mu_mismatch = 0.0
 
         # Get mini batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -258,6 +259,10 @@ class PPOCaTTeacherStudent(PPOCaT):
                 )  # type: ignore
                 # loss_student += 1.0 * student_kl_loss
 
+                mu_student = student_distribution_params[0]
+                mu_teacher = teacher_distribution_params[0]
+                mu_mismatch = (mu_student - mu_teacher).abs().mean()
+
                 # loss = student_latent_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
                 # self.unfreeze_module(self.actor.distribution)
@@ -316,14 +321,12 @@ class PPOCaTTeacherStudent(PPOCaT):
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             if self.learning_phase == "A":
-                loss.backward(retain_graph=True)
-                g_kl_zs, = torch.autograd.grad(student_kl, latent_student, retain_graph=True)
-                (4.0 * latent_student).backward(g_kl_zs, retain_graph=True)
-                (0.5 * student_latent_loss).backward()
+                loss.backward()
             elif self.learning_phase == "B":
                 loss.backward(retain_graph=True)
-                g_kl_zs, = torch.autograd.grad(student_kl, latent_student, retain_graph=True)
-                (4.0 * latent_student).backward(g_kl_zs, retain_graph=True)
+                # g_kl_zs, = torch.autograd.grad(student_kl, latent_student, retain_graph=True)
+                # (3.0 * latent_student).backward(g_kl_zs, retain_graph=True)
+                (3.0 * student_kl).backward(retain_graph=True)
                 (0.5 * student_latent_loss).backward()
             else:
                 loss.backward()
@@ -392,6 +395,7 @@ class PPOCaTTeacherStudent(PPOCaT):
 
             mean_pre_teacher_norm += pre_teacher_norm.item()
             mean_pre_student_norm += pre_student_norm.item()
+            mean_mu_mismatch += mu_mismatch.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -409,6 +413,7 @@ class PPOCaTTeacherStudent(PPOCaT):
         mean_student_norm /= num_updates
         mean_pre_teacher_norm /= num_updates
         mean_pre_student_norm /= num_updates
+        mean_mu_mismatch /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -430,6 +435,8 @@ class PPOCaTTeacherStudent(PPOCaT):
         loss_dict["student_norm"] = mean_student_norm
         loss_dict["mean_pre_teacher_norm"] = mean_pre_teacher_norm
         loss_dict["mean_pre_student_norm"] = mean_pre_student_norm
+        loss_dict["mu_mismatch"] = mean_mu_mismatch
+        loss_dict["alpha"] = self.alpha
 
         return loss_dict
 
@@ -614,25 +621,25 @@ class PPOCaTTeacherStudent(PPOCaT):
 
     def update_training_mix(self, step: int, optimizer: str, learning_rate: float, **kwargs: Any) -> float:
 
-        new_alpha = self.cosine_alpha(step, warmup_steps=400, ramp_steps=600)
+        new_alpha = self.cosine_alpha(step, warmup_steps=1500, ramp_steps=1500)
         refresh_optimizer = False
         if self.learning_phase == "":
             print("\033[91m== ENTER PHASE A == \033[0m")
             self.learning_phase = "A"
             # Phase A: Warmup by learning teacher + actor.
             # Unfreeze everything then freeze student only.
-            # self.unfreeze_module(self.actor)
-            # self.freeze_module(self.actor.student)
-            # self.freeze_module(self.actor.student_normalizer)
+            self.unfreeze_module(self.actor)
+            self.freeze_module(self.actor.student)
+            self.freeze_module(self.actor.student_normalizer)
             refresh_optimizer = True
-        elif self.learning_phase == "A" and new_alpha > 0:
+        elif self.learning_phase == "A" and step == 1000:  # new_alpha > 0:
             print("\033[91m== ENTER PHASE B == \033[0m")
             self.learning_phase = "B"
             # Phase B: Learning student with frozen actor and teacher.
             # Freeze everything then unfreeze student only.
-            # self.freeze_module(self.actor)
-            # self.unfreeze_module(self.actor.student)
-            # self.unfreeze_module(self.actor.student_normalizer)
+            self.freeze_module(self.actor)
+            self.unfreeze_module(self.actor.student)
+            self.unfreeze_module(self.actor.student_normalizer)
             # self.unfreeze_module(self.actor.distribution)
             refresh_optimizer = True
         elif self.learning_phase == "B" and new_alpha == 1.0:
@@ -688,7 +695,7 @@ class PPOCaTTeacherStudent(PPOCaT):
             #     chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
             # )  # type: ignore
 
-        print(f"\034[91m== PHASE {self.learning_phase} == \034[0m")
+        print(f"\034[91m== PHASE {self.learning_phase} {new_alpha} == \034[0m")
 
         self.alpha = new_alpha
         return self.alpha
