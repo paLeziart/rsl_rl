@@ -11,14 +11,14 @@ from typing import Any
 
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.models import MLPModel, MLPEncoderModel
+from rsl_rl.models import MLPEncoderModel, MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 
 from .ppo_cat import PPOCaT
 
 
-class PPOCaTTeacherStudent(PPOCaT):
+class PPOCaTEncoder(PPOCaT):
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347).
 
     Support the Constraints as Terminations (CaT) -> See PPOCaT.
@@ -54,6 +54,10 @@ class PPOCaTTeacherStudent(PPOCaT):
         #     chain(self.actor.student.parameters(), self.actor.student_normalizer.parameters()), lr=learning_rate
         # )  # type: ignore
 
+        self.optimizer = resolve_optimizer(optimizer)(
+            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+        )  # type: ignore
+
     def compute_latent(self, obs: TensorDict, switch: torch.Tensor) -> None:
         """Compute the latent space information and store it in obs["latent"]."""
         # Mixed actor input: do not backprop into student
@@ -72,7 +76,7 @@ class PPOCaTTeacherStudent(PPOCaT):
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        mean_student_latent_loss = 0
+        mean_encoder_loss = 0
         mean_student_kl_loss = 0
         mean_teacher_norm = 0
         mean_student_norm = 0
@@ -122,7 +126,6 @@ class PPOCaTTeacherStudent(PPOCaT):
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
                 stochastic_output=True,
-                alpha=self.alpha,
             )
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
@@ -184,64 +187,41 @@ class PPOCaTTeacherStudent(PPOCaT):
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
-            # Student encoder loss
-            if True: # self.learning_phase == "A":
-                # self.freeze_module(self.actor.distribution)
-                # self.freeze_module(self.actor.actor)
-                # self.freeze_module(self.actor.actor_normalizer)
+            self.actor(
+                batch.observations,
+                masks=batch.masks,
+                hidden_state=batch.hidden_states[0],
+                stochastic_output=True,
+            )
+            privileged_predicted = batch.observations["latent"]  # type: ignore
+            privileged_truth = self.actor.get_observations(batch.observations,
+                                                           "privileged",
+                                                           batch.masks,
+                                                           batch.hidden_states[0])
+            
+            
+            #self.critic.get_latent(
+            #    batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[0]
+            #)[:, -16:]
 
-                # Get student and teacher encodings
-                #print("= TEACHER LATENT")
-                with torch.no_grad():
-                    _, pre_teacher_norm, _ = self.actor(
-                        batch.observations,
-                        masks=batch.masks,
-                        hidden_state=batch.hidden_states[0],
-                        stochastic_output=True,
-                        alpha=0,
-                        with_latent_norm=True,
-                    )
-                    latent_teacher = batch.observations["latent"].clone()  # type: ignore
-                    teacher_distribution_params = tuple(
-                        p[:original_batch_size].detach() for p in self.actor.output_distribution_params
-                    )
+            # print("Predicted")
+            # print(encoder_latent[0])
+            # print("Truth")
+            # print(critic_latent[0])
 
-                #print("= STUDENT LATENT")
-                _, _, pre_student_norm = self.actor(
-                    batch.observations,
-                    masks=batch.masks,
-                    hidden_state=batch.hidden_states[0],
-                    stochastic_output=True,
-                    alpha=1,
-                    with_latent_norm=True,
-                )
-                latent_student = batch.observations["latent"]  # type: ignore
-                student_distribution_params = tuple(
-                    p[:original_batch_size] for p in self.actor.output_distribution_params
-                )
+            mseloss = torch.nn.MSELoss()
+            encoder_loss = mseloss(privileged_predicted, privileged_truth.detach())
+            loss += encoder_loss
 
-                # print("==============")
-                # print(teacher_distribution_params)
-                # print(student_distribution_params)
+            perDim = torch.mean(torch.square(privileged_predicted - privileged_truth), dim=0)
+            # print(perDim)
+            #denormed_encoder = self.critic.obs_normalizer.inverse(privileged_predicted)
+            #denormed_critic = batch.observations["critic"][:, -20:]
+            # print("====")
+            # print(denormed_critic[0])
+            # print(denormed_encoder[0])
+            # print(encoder_latent[0] - critic_latent[0])
 
-                mseloss = torch.nn.MSELoss()
-                student_latent_loss = mseloss(latent_student, latent_teacher.detach())
-                loss_student = 1.0 * student_latent_loss
-
-                student_kl = torch.mean(
-                    self.actor.get_kl_divergence(teacher_distribution_params, student_distribution_params)
-                )  # type: ignore
-                # loss_student += 1.0 * student_kl_loss
-
-                mu_student = student_distribution_params[0]
-                mu_teacher = teacher_distribution_params[0]
-                mu_mismatch = (mu_student - mu_teacher).abs().mean()
-
-                # loss = student_latent_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
-
-                # self.unfreeze_module(self.actor.distribution)
-                # self.unfreeze_module(self.actor.actor)
-                # self.unfreeze_module(self.actor.actor_normalizer)
 
             # Symmetry loss
             if self.symmetry:
@@ -256,8 +236,7 @@ class PPOCaTTeacherStudent(PPOCaT):
                     num_aug = int(batch.observations.batch_size[0] / original_batch_size)
 
                 # Actions predicted by the actor for symmetrically-augmented observations
-                mean_actions = self.actor(batch.observations.detach().clone(),
-                                          alpha=self.alpha)  # , detach().clone())
+                mean_actions = self.actor(batch.observations.detach().clone())  # , detach().clone())
 
                 # Compute the symmetrically augmented actions
                 # Note: We are assuming the first augmentation is the original one. We do not use the batch.actions from
@@ -294,45 +273,7 @@ class PPOCaTTeacherStudent(PPOCaT):
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
-            if self.learning_phase == "A":
-                loss.backward()
-            elif self.learning_phase == "B":
-                loss.backward(retain_graph=True)
-                # g_kl_zs, = torch.autograd.grad(student_kl, latent_student, retain_graph=True)
-                # (3.0 * latent_student).backward(g_kl_zs, retain_graph=True)
-                (3.0 * student_kl).backward(retain_graph=True)
-                (0.5 * student_latent_loss).backward()
-            else:
-                loss.backward()
-
-            # 4) Inspect grads
-            # def report(module, name):
-            #     tot = 0.0
-            #     nz  = 0
-            #     for p in module.parameters():
-            #         if p.grad is not None:
-            #             g = p.grad.detach()
-            #             tot += g.norm().item()
-            #             nz += 1
-            #     print(f"{name}: params_with_grad={nz}, grad_norm_sum={tot:.6f}")
-
-            # #    self.actor.distribution.parameters(),
-            # #           self.actor.actor.parameters(),
-            # #           self.actor.actor_normalizer.parameters(),
-            # #           self.critic.parameters(),
-            # #           self.actor.teacher.parameters(),
-            # #           self.actor.teacher_normalizer.parameters()
-            # print("====== ", self.alpha)
-            # report(self.actor.student, "student_enc")  # should be >0
-            # report(self.actor.student_normalizer, "student_enc")  # should be >0
-            # report(self.actor.actor,       "actor")        # should be 0 (no KL grad to actor)
-            # report(self.actor.actor_normalizer,       "actor")        # should be 0 (no KL grad to actor)
-            # report(self.actor.teacher, "teacher_enc")  # should be 0
-            # report(self.actor.teacher_normalizer, "teacher_enc")  # should be 0
-            # report(self.actor.distribution, "distribution")
-            # report(self.critic,      "critic")       # should be 0
-
-
+            loss.backward()
 
             # Compute the gradients for RND
             if self.rnd:
@@ -363,13 +304,14 @@ class PPOCaTTeacherStudent(PPOCaT):
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
             # Encoder loss
-            if self.learning_phase != "C":
-                mean_student_latent_loss += student_latent_loss.item()
-                mean_student_kl_loss += student_kl.item() / student_distribution_params[1].shape[-1]
+            mean_encoder_loss += encoder_loss.item()
+            # if self.learning_phase != "C":
+            #     mean_encoder_loss += student_latent_loss.item()
+            #     mean_student_kl_loss += student_kl.item() / student_distribution_params[1].shape[-1]
 
-            mean_pre_teacher_norm += pre_teacher_norm.item()
-            mean_pre_student_norm += pre_student_norm.item()
-            mean_mu_mismatch += mu_mismatch.item()
+            # mean_pre_teacher_norm += pre_teacher_norm.item()
+            # mean_pre_student_norm += pre_student_norm.item()
+            # mean_mu_mismatch += mu_mismatch.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -381,7 +323,7 @@ class PPOCaTTeacherStudent(PPOCaT):
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        mean_student_latent_loss /= num_updates
+        mean_encoder_loss /= num_updates
         mean_student_kl_loss /= num_updates
         mean_teacher_norm /= num_updates
         mean_student_norm /= num_updates
@@ -403,14 +345,13 @@ class PPOCaTTeacherStudent(PPOCaT):
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        loss_dict["student_latent"] = mean_student_latent_loss
-        loss_dict["student_kl"] = mean_student_kl_loss
-        loss_dict["teacher_norm"] = mean_teacher_norm
-        loss_dict["student_norm"] = mean_student_norm
-        loss_dict["mean_pre_teacher_norm"] = mean_pre_teacher_norm
-        loss_dict["mean_pre_student_norm"] = mean_pre_student_norm
-        loss_dict["mu_mismatch"] = mean_mu_mismatch
-        loss_dict["alpha"] = self.alpha
+        loss_dict["encoder"] = mean_encoder_loss
+        # loss_dict["student_kl"] = mean_student_kl_loss
+        # loss_dict["teacher_norm"] = mean_teacher_norm
+        # loss_dict["student_norm"] = mean_student_norm
+        # loss_dict["mean_pre_teacher_norm"] = mean_pre_teacher_norm
+        # loss_dict["mean_pre_student_norm"] = mean_pre_student_norm
+        # loss_dict["mu_mismatch"] = mean_mu_mismatch
 
         return loss_dict
 
@@ -451,8 +392,7 @@ class PPOCaTTeacherStudent(PPOCaT):
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
-                "teacher": True,
-                "student": True,
+                "encoder": True,
             }
 
         # Load the specified models
@@ -468,21 +408,21 @@ class PPOCaTTeacherStudent(PPOCaT):
             self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
-    def get_policy(self) -> TeacherStudentModel:
+    def get_policy(self) -> MLPEncoderModel:
         """Get the policy model."""
         # TODO: Properly return actor/teacher/student
         return self.actor
 
     @staticmethod
-    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPOCaTTeacherStudent:
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPOCaTEncoder:
         """Construct the PPO algorithm."""
         # Resolve class callables
-        alg_class: type[PPOCaTTeacherStudent] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
-        actor_class: type[TeacherStudentModel] = resolve_callable(cfg["actor_teacher_student"].pop("class_name"))  # type: ignore
+        alg_class: type[PPOCaTEncoder] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
+        actor_class: type[MLPEncoderModel] = resolve_callable(cfg["actor_encoder"].pop("class_name"))  # type: ignore
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
 
         # Resolve observation groups
-        default_sets = ["actor", "critic", "teacher", "student"]
+        default_sets = ["actor", "critic", "encoder"]
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
@@ -494,9 +434,9 @@ class PPOCaTTeacherStudent(PPOCaT):
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
         # Initialize the policy
-        obs_sets = {"actor": "actor", "teacher": "teacher", "student": "student"}
-        actor: TeacherStudentModel = actor_class(
-            obs, cfg["obs_groups"], obs_sets, env.num_actions, **cfg["actor_teacher_student"]
+        obs_sets = {"actor": "actor", "encoder": "encoder", "privileged": "privileged"}
+        actor: MLPEncoderModel = actor_class(
+            obs, cfg["obs_groups"], obs_sets, env.num_actions, **cfg["actor_encoder"]
         ).to(device)
         print(f"Actor - Teacher - Student Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
@@ -505,11 +445,12 @@ class PPOCaTTeacherStudent(PPOCaT):
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
-        storage = RolloutStorage("rl-CaT-TS", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage = RolloutStorage("rl-CaT", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
-        alg: PPOCaTTeacherStudent = alg_class(actor, critic, storage, device=device,
-                                              **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPOCaTEncoder = alg_class(
+            actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"]
+        )
 
         return alg
 
@@ -646,6 +587,8 @@ class PPOCaTTeacherStudent(PPOCaT):
             params.append({"params": other_params, "lr": 3e-4})
 
             self.optimizer = resolve_optimizer(optimizer)(params)
+
+            quit()
 
             # Create the optimizer
             # self.optimizer = resolve_optimizer(optimizer)([

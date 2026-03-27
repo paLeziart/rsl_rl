@@ -109,23 +109,46 @@ class StudentEncoder(nn.Module):
         self.feat_per_frame = sum(per_frame_dims)
 
         self.gru = nn.GRU(
-            input_size=self.feat_per_frame, hidden_size=hidden_dim, num_layers=1, batch_first=True, bidirectional=False
+            input_size=self.feat_per_frame,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=False,
         )
         self.proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, latent_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, latent_dim)
         )
-        self.out_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
+
+        # self.test = nn.Linear(690, latent_dim)
+        # self.out_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
 
     def forward(self, x: torch.Tensor, with_norm: bool = False) -> torch.Tensor:
         """Forward pass."""
+
+        # print("= Before reshape")
+        # print(x.shape)
+        # print(x[0, -34:])
+
+        # return self.test(x)
+
         # Reshape flat [B, T x F] input into [B, T, F]
         x_seq, _ = unstack_history_from_segments(
             x, self.obs_dims, history_length=self.history_length, newest_first=self.newest_first
         )  # [B, T, F]
+
+        # print("= Forward")
+        # print(x_seq[0:1, :, -3:])
+
         out, _ = self.gru(x_seq)  # [B, T, H]
         h_last = out[:, -1]  # summarize up to current time
         z = self.proj(h_last)
+        # print(z[0, -3:])
+        # quit()
+        return z
+
         if not with_norm:
             return self.out_norm(z)
         else:
