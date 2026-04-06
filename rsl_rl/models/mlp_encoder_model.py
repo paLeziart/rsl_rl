@@ -89,7 +89,7 @@ class MLPEncoderModel(nn.Module):
 
         # MLP
         self.actor = MLP(obs_dim["actor"], actor_output_dim, hidden_dims, activation)
-        self.encoder = StudentEncoder([30, 30, 190, 190, 190, 30, 30], 10, 128, latent_dim, False)
+        self.encoder = StudentEncoder([30, 30, 190, 190, 190, 30, 120], 10, 128, latent_dim, False)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
@@ -126,14 +126,11 @@ class MLPEncoderModel(nn.Module):
         # print("LATENT")
         # print(obs["latent"][0])
 
-        obs["latent_denormed"] = self.privileged_normalizer.inverse(obs["latent"])
-
-        print("Estim", obs["latent_denormed"][0])
-
-        obs_list = [obs[obs_group] for obs_group in self.obs_groups["privileged"]]
-        privileged = torch.cat(obs_list, dim=-1)
-        print("Privi", privileged[0])
-        
+        # obs["latent_denormed"] = self.privileged_normalizer.inverse(obs["latent"])
+        # print("Estim", obs["latent_denormed"][0])
+        # obs_list = [obs[obs_group] for obs_group in self.obs_groups["privileged"]]
+        # privileged = torch.cat(obs_list, dim=-1)
+        # print("Privi", privileged[0])
 
         # MLP forward pass
         mlp_output = self.actor((self.get_observations(obs, "actor", masks, hidden_state)).detach())

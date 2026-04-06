@@ -198,11 +198,9 @@ class PPOCaTEncoder(PPOCaT):
                                                            "privileged",
                                                            batch.masks,
                                                            batch.hidden_states[0])
-            
-            
-            #self.critic.get_latent(
+            # self.critic.get_latent(
             #    batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[0]
-            #)[:, -16:]
+            # )[:, -16:]
 
             # print("Predicted")
             # print(encoder_latent[0])
@@ -215,13 +213,12 @@ class PPOCaTEncoder(PPOCaT):
 
             perDim = torch.mean(torch.square(privileged_predicted - privileged_truth), dim=0)
             # print(perDim)
-            #denormed_encoder = self.critic.obs_normalizer.inverse(privileged_predicted)
-            #denormed_critic = batch.observations["critic"][:, -20:]
+            # denormed_encoder = self.critic.obs_normalizer.inverse(privileged_predicted)
+            # denormed_critic = batch.observations["critic"][:, -20:]
             # print("====")
             # print(denormed_critic[0])
             # print(denormed_encoder[0])
             # print(encoder_latent[0] - critic_latent[0])
-
 
             # Symmetry loss
             if self.symmetry:
